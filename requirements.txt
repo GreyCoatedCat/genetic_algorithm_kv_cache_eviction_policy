@@ -1,0 +1,4 @@
+torch
+transformers==5.22.1
+accelerate
+matplotlib
