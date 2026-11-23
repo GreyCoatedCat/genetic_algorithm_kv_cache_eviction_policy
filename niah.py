@@ -1,11 +1,13 @@
 """Tugas Needle-in-a-Haystack dengan banyak needle per sampel (mirip MQ-NIAH RULER).
 
-Skornya recall: proporsi string jawaban yang muncul di output model. Dengan
-beberapa needle, skor sampel bertingkat sehingga GA punya sinyal yang lebih halus
-daripada benar/salah.
+Skor uji adalah recall: proporsi string jawaban yang muncul di output model.
+Fitness GA memakai skor parsial per digit, karena pada budget kecil model sering
+benar di awal angka lalu mengarang, dan recall ketat memberi nilai 0 untuk semuanya.
 """
 
+import os
 import random
+import re
 from dataclasses import dataclass
 
 CITIES = [
@@ -30,6 +32,15 @@ class Sample:
 
     def score(self, output: str) -> float:
         return sum(answer in output for answer in self.answers) / len(self.answers)
+
+    def partial_score(self, output: str) -> float:
+        """Rata-rata porsi digit awal yang benar, memakai angka output terdekat tiap jawaban."""
+        numbers = re.findall(r"\d+", output)
+        credits = [
+            max((len(os.path.commonprefix([answer, number])) for number in numbers), default=0) / len(answer)
+            for answer in self.answers
+        ]
+        return sum(credits) / len(credits)
 
 
 def make_sample(tokenizer, context_tokens: int, num_needles: int, rng: random.Random) -> Sample:

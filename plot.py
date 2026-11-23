@@ -1,4 +1,4 @@
-"""Buat grafik dari history.csv dan results.json tanpa menjalankan model."""
+"""Rangkum semua seed di folder hasil menjadi grafik, tanpa menjalankan model."""
 
 import argparse
 import csv
@@ -23,6 +23,17 @@ METHODS = {
 }
 
 
+def mean(values):
+    values = list(values)
+    return sum(values) / len(values)
+
+
+def summarize(columns):
+    """Dari daftar baris per seed, hasilkan rata-rata, minimum, dan maksimum per posisi."""
+    rows = list(zip(*columns))
+    return [mean(row) for row in rows], [min(row) for row in rows], [max(row) for row in rows]
+
+
 def style(ax):
     ax.set_facecolor(SURFACE)
     ax.spines[["top", "right"]].set_visible(False)
@@ -42,98 +53,135 @@ def save(fig, path):
     print(path)
 
 
-def plot_convergence(history, path):
-    """Fitness tiap generasi; garis pemisah menandai pergantian grup layer."""
-    fig, ax = plt.subplots(figsize=(10, 4.5), facecolor=SURFACE)
-    steps = range(len(history))
-    ax.plot(steps, [float(row["mean_fitness"]) for row in history], color=MUTED, linewidth=1.5, label="Rata-rata populasi")
-    ax.plot(steps, [float(row["best_fitness"]) for row in history], color=METHODS["evolkv_ga"][1], linewidth=2, label="Terbaik")
+def plot_series(ax, histories, column, color, label):
+    average, low, high = summarize([[float(row[column]) for row in history] for history in histories])
+    steps = range(len(average))
+    ax.fill_between(steps, low, high, color=color, alpha=0.15, linewidth=0)
+    ax.plot(steps, average, color=color, linewidth=2, label=label)
+
+
+def plot_convergence(histories, path):
+    """Fitness dan recall latih per generasi; fitness memakai skor parsial, recall skor ketat."""
+    blue = METHODS["evolkv_ga"][1]
+    fig, (top, bottom) = plt.subplots(2, 1, figsize=(10, 7), sharex=True, facecolor=SURFACE)
+    plot_series(top, histories, "mean_fitness", MUTED, "Rata-rata populasi")
+    plot_series(top, histories, "best_fitness", blue, "Terbaik")
+    plot_series(bottom, histories, "train_recall", blue, "Kandidat terbaik")
 
     groups = {}
-    for step, row in enumerate(history):
+    for step, row in enumerate(histories[0]):
         groups.setdefault((int(row["first_layer"]), int(row["last_layer"])), []).append(step)
-    top = max(float(row["best_fitness"]) for row in history)
+    for ax in (top, bottom):
+        ax.set_ylim(bottom=0)
+        for members in groups.values():
+            if members[0] > 0:
+                ax.axvline(members[0] - 0.5, color=GRID, linewidth=1)
+    y_top = top.get_ylim()[1]
+    top.set_ylim(0, y_top * 1.12)
     for (first, last), members in groups.items():
-        if members[0] > 0:
-            ax.axvline(members[0] - 0.5, color=GRID, linewidth=1)
-        center = (members[0] + members[-1]) / 2
-        ax.text(center, top * 1.1, f"Layer {first}–{last}", ha="center", color=MUTED, fontsize=9)
+        top.text((members[0] + members[-1]) / 2, y_top * 1.04, f"Layer {first}–{last}", ha="center", color=MUTED, fontsize=9)
 
-    ax.set_ylim(0, top * 1.2 or 1)
-    ax.set_xlabel("Generasi kumulatif")
-    ax.set_ylabel("Fitness")
-    ax.set_title("Konvergensi Genetic Algorithm per grup layer", loc="left")
-    ax.legend(frameon=False, labelcolor=MUTED, loc="center right")
-    style(ax)
+    top.set_ylabel("Fitness (skor parsial)")
+    top.set_title(f"Konvergensi Genetic Algorithm, rata-rata dan rentang {len(histories)} seed", loc="left")
+    top.legend(frameon=False, labelcolor=MUTED, loc="lower right")
+    bottom.set_xlabel("Generasi kumulatif")
+    bottom.set_ylabel("Recall latih (skor ketat)")
+    style(top)
+    style(bottom)
     save(fig, path)
 
 
-def plot_budgets(results, path):
+def plot_budgets(all_results, path):
     """Alokasi per layer pada target utama, seperti Gambar 2a di paper."""
-    target = results["args"]["target"]
-    evolved = results["targets"][str(target)]["budgets"]
-    layers = len(evolved)
-    allocations = {
-        "evolkv_ga": evolved,
-        "snapkv": uniform_budgets(layers, target),
-        "pyramidkv": pyramid_budgets(layers, target, results["args"]["window"]),
-    }
+    args = all_results[0]["args"]
+    target = args["target"]
+    average, low, high = summarize([results["targets"][str(target)]["budgets"] for results in all_results])
+    layers = len(average)
 
     fig, ax = plt.subplots(figsize=(10, 4.5), facecolor=SURFACE)
-    for method, budgets in allocations.items():
+    blue = METHODS["evolkv_ga"][1]
+    ax.fill_between(range(layers), low, high, color=blue, alpha=0.15, linewidth=0)
+    ax.plot(range(layers), average, color=blue, linewidth=2, marker="o", markersize=4, label="EvolKV-GA")
+    for method, budgets in (
+        ("snapkv", uniform_budgets(layers, target)),
+        ("pyramidkv", pyramid_budgets(layers, target, args["window"])),
+    ):
         label, color = METHODS[method]
-        ax.plot(range(layers), budgets, color=color, linewidth=2, marker="o", markersize=4, label=label)
+        ax.plot(range(layers), budgets, color=color, linewidth=2, label=label)
     ax.set_ylim(bottom=0)
     ax.set_xlabel("Layer")
     ax.set_ylabel("Budget KV cache (token)")
-    ax.set_title(f"Alokasi budget per layer, target rata-rata c = {target}", loc="left")
+    ax.set_title(f"Alokasi budget per layer pada c = {target}, rentang {len(all_results)} seed", loc="left")
     ax.legend(frameon=False, labelcolor=MUTED, loc="upper left")
     style(ax)
     save(fig, path)
 
 
-def plot_recall(results, path):
-    """Recall data uji per target budget, dengan Full KV sebagai batas acuan."""
-    targets = list(results["targets"])
+def plot_recall(all_results, path):
+    """Recall data uji per target budget; garis kecil menunjukkan rentang antar seed."""
+    targets = list(all_results[0]["targets"])
     width = 0.26
     fig, ax = plt.subplots(figsize=(8, 4.5), facecolor=SURFACE)
     for offset, method in enumerate(["snapkv", "pyramidkv", "evolkv_ga"]):
         label, color = METHODS[method]
-        values = [results["targets"][target][method] for target in targets]
+        values, low, high = summarize(
+            [[results["targets"][target][method] for target in targets] for results in all_results]
+        )
         positions = [i + (offset - 1) * width for i in range(len(targets))]
-        bars = ax.bar(positions, values, width * 0.9, color=color, label=label)
-        ax.bar_label(bars, labels=[f"{v:.2f}" for v in values], padding=2, fontsize=8, color=MUTED)
+        errors = [[v - a for v, a in zip(values, low)], [b - v for v, b in zip(values, high)]]
+        ax.bar(positions, values, width * 0.9, color=color, label=label)
+        ax.errorbar(positions, values, yerr=errors, fmt="none", ecolor=TEXT, elinewidth=1, capsize=3)
+        for x, value, top in zip(positions, values, high):
+            ax.text(x, top + 0.02, f"{value:.2f}", ha="center", fontsize=8, color=MUTED)
 
-    full = results["full"]
+    full = mean(results["full"] for results in all_results)
     ax.axhline(full, color=TEXT, linewidth=1.5, linestyle="--")
-    ax.text(len(targets) - 0.5, full + 0.015, f"Full KV {full:.2f}", ha="right", color=MUTED, fontsize=9)
+    ax.text(-0.45, full + 0.015, f"Full KV {full:.2f}", ha="left", color=MUTED, fontsize=9)
     ax.set_xticks(range(len(targets)), [f"c = {target}" for target in targets])
-    ax.set_ylim(0, 1)
+    ax.set_ylim(0, 1.05)
     ax.set_ylabel("Recall")
-    ax.set_title("Recall data uji per target budget", loc="left")
+    ax.set_title(f"Recall data uji, rata-rata dan rentang {len(all_results)} seed", loc="left")
     ax.legend(frameon=False, labelcolor=MUTED, loc="upper left", ncols=3)
     style(ax)
     ax.grid(axis="x", visible=False)
     save(fig, path)
 
 
+def print_summary(all_results):
+    print(f"Full KV: {mean(results['full'] for results in all_results):.3f}")
+    print(f"{'c':>6} {'SnapKV':>8} {'PyramidKV':>10} {'EvolKV-GA':>10} {'rentang EvolKV-GA':>18}")
+    for target in all_results[0]["targets"]:
+        values = {m: [results["targets"][target][m] for results in all_results] for m in METHODS}
+        evolved = values["evolkv_ga"]
+        print(
+            f"{target:>6} {mean(values['snapkv']):>8.3f} {mean(values['pyramidkv']):>10.3f} "
+            f"{mean(evolved):>10.3f} {f'{min(evolved):.3f}-{max(evolved):.3f}':>18}"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--history", default="history.csv")
-    parser.add_argument("--results", default="results.json")
+    parser.add_argument("--runs", default="runs", help="folder berisi seed_*/history.csv dan seed_*/results.json")
     parser.add_argument("--output-dir", default="figures")
     args = parser.parse_args()
 
-    with open(args.history, newline="") as file:
-        history = list(csv.DictReader(file))
-    with open(args.results) as file:
-        results = json.load(file)
+    run_dirs = sorted(Path(args.runs).glob("seed_*"))
+    if not run_dirs:
+        raise SystemExit(f"Tidak ada folder seed_* di {args.runs}; jalankan run.py dulu")
+
+    histories, all_results = [], []
+    for run_dir in run_dirs:
+        with open(run_dir / "history.csv", newline="") as file:
+            histories.append(list(csv.DictReader(file)))
+        with open(run_dir / "results.json") as file:
+            all_results.append(json.load(file))
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(exist_ok=True)
-    plot_convergence(history, output_dir / "convergence.png")
-    plot_budgets(results, output_dir / "budgets.png")
-    plot_recall(results, output_dir / "recall.png")
+    print_summary(all_results)
+    plot_convergence(histories, output_dir / "convergence.png")
+    plot_budgets(all_results, output_dir / "budgets.png")
+    plot_recall(all_results, output_dir / "recall.png")
 
 
 if __name__ == "__main__":

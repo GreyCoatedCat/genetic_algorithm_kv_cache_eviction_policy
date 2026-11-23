@@ -3,6 +3,7 @@
 import argparse
 import csv
 import json
+from pathlib import Path
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -25,14 +26,81 @@ def parse_args():
     parser.add_argument("--needles", type=int, default=3)
     parser.add_argument("--train-samples", type=int, default=10)
     parser.add_argument("--test-samples", type=int, default=30)
-    parser.add_argument("--generations", type=int, default=6)
+    parser.add_argument("--generations", type=int, default=8)
     parser.add_argument("--population", type=int, help="default mengikuti rumus paper")
     parser.add_argument("--high", type=int, help="batas atas gen, default 4 * target")
     parser.add_argument("--max-new-tokens", type=int, default=40)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--output", default="results.json")
-    parser.add_argument("--history", default="history.csv", help="riwayat GA per generasi untuk plot.py")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
+    parser.add_argument("--output-dir", default="runs", help="hasil tiap seed ditulis ke <folder>/seed_<n>")
     return parser.parse_args()
+
+
+def run_seed(args, seed, tokenizer, compressor, num_layers):
+    def prepare(count, sample_seed):
+        samples = make_samples(tokenizer, count, args.context_tokens, args.needles, sample_seed)
+        return [(sample, compressor.prefill(sample.input_ids)) for sample in samples]
+
+    def generate(prepared, budgets):
+        return [(sample, compressor.generate(prefilled, budgets, args.max_new_tokens)) for sample, prefilled in prepared]
+
+    def recall(prepared, budgets):
+        scores = [sample.score(text) for sample, text in generate(prepared, budgets)]
+        return sum(scores) / len(scores)
+
+    print(f"seed {seed}: menyiapkan {args.train_samples} sampel latih dan {args.test_samples} sampel uji")
+    train = prepare(args.train_samples, seed)
+    test = prepare(args.test_samples, seed + 1)
+
+    train_recall = {}
+
+    def train_performance(candidate):
+        outputs = generate(train, candidate)
+        train_recall[tuple(candidate)] = sum(sample.score(text) for sample, text in outputs) / len(outputs)
+        return sum(sample.partial_score(text) for sample, text in outputs) / len(outputs)
+
+    config = GAConfig(
+        population_size=args.population or population_size(args.group_size),
+        generations=args.generations,
+    )
+    history = []
+    budgets, best_fitness = evolkv_search(
+        train_performance,
+        num_layers,
+        args.target,
+        low=args.window,
+        high=args.high or 4 * args.target,
+        group_size=args.group_size,
+        config=config,
+        seed=seed,
+        history=history,
+        describe=lambda candidate: {"train_recall": train_recall[tuple(candidate)]},
+    )
+    print(f"fitness terbaik {best_fitness:.4f}, budget {budgets}")
+
+    results = {"full": recall(test, [10**9] * num_layers), "targets": {}}
+    print(f"\nRecall uji seed {seed}\nFull KV: {results['full']:.3f}")
+    print(f"{'c':>6} {'SnapKV':>8} {'PyramidKV':>10} {'EvolKV-GA':>10}")
+    for target in [args.target, *args.expand]:
+        evolved = complete_budgets(budgets, target)
+        row = {
+            "snapkv": recall(test, uniform_budgets(num_layers, target)),
+            "pyramidkv": recall(test, pyramid_budgets(num_layers, target, args.window)),
+            "evolkv_ga": recall(test, evolved),
+            "budgets": evolved,
+        }
+        results["targets"][target] = row
+        print(f"{target:>6} {row['snapkv']:>8.3f} {row['pyramidkv']:>10.3f} {row['evolkv_ga']:>10.3f}")
+
+    results["args"] = {**vars(args), "seed": seed}
+    run_dir = Path(args.output_dir) / f"seed_{seed}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    with open(run_dir / "results.json", "w") as file:
+        json.dump(results, file, indent=2)
+    with open(run_dir / "history.csv", "w", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=history[0].keys())
+        writer.writeheader()
+        writer.writerows(history)
+    print(f"\nHasil disimpan di {run_dir}\n")
 
 
 def main():
@@ -46,62 +114,10 @@ def main():
     ).to(device).eval()
     compressor = KVCompressor(model, tokenizer, args.window, args.kernel)
     num_layers = len(model.model.layers)
+    print(f"{num_layers} layer")
 
-    def prepare(count, seed):
-        samples = make_samples(tokenizer, count, args.context_tokens, args.needles, seed)
-        return [(sample, compressor.prefill(sample.input_ids)) for sample in samples]
-
-    def evaluate(prepared, budgets):
-        scores = [
-            sample.score(compressor.generate(prefilled, budgets, args.max_new_tokens))
-            for sample, prefilled in prepared
-        ]
-        return sum(scores) / len(scores)
-
-    print(f"{num_layers} layer, menyiapkan {args.train_samples} sampel latih dan {args.test_samples} sampel uji")
-    train = prepare(args.train_samples, args.seed)
-    test = prepare(args.test_samples, args.seed + 1)
-
-    config = GAConfig(
-        population_size=args.population or population_size(args.group_size),
-        generations=args.generations,
-    )
-    history = []
-    budgets, best_fitness = evolkv_search(
-        lambda candidate: evaluate(train, candidate),
-        num_layers,
-        args.target,
-        low=args.window,
-        high=args.high or 4 * args.target,
-        group_size=args.group_size,
-        config=config,
-        seed=args.seed,
-        history=history,
-    )
-    with open(args.history, "w", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=history[0].keys())
-        writer.writeheader()
-        writer.writerows(history)
-    print(f"fitness terbaik {best_fitness:.4f}, budget mentah {budgets}")
-
-    results = {"full": evaluate(test, [10**9] * num_layers), "targets": {}}
-    print(f"\nRecall uji\nFull KV: {results['full']:.3f}")
-    print(f"{'c':>6} {'SnapKV':>8} {'PyramidKV':>10} {'EvolKV-GA':>10}")
-    for target in [args.target, *args.expand]:
-        evolved = complete_budgets(budgets, target)
-        row = {
-            "snapkv": evaluate(test, uniform_budgets(num_layers, target)),
-            "pyramidkv": evaluate(test, pyramid_budgets(num_layers, target, args.window)),
-            "evolkv_ga": evaluate(test, evolved),
-            "budgets": evolved,
-        }
-        results["targets"][target] = row
-        print(f"{target:>6} {row['snapkv']:>8.3f} {row['pyramidkv']:>10.3f} {row['evolkv_ga']:>10.3f}")
-
-    results["args"] = vars(args)
-    with open(args.output, "w") as file:
-        json.dump(results, file, indent=2)
-    print(f"\nHasil disimpan di {args.output} dan {args.history}")
+    for seed in args.seeds:
+        run_seed(args, seed, tokenizer, compressor, num_layers)
 
 
 if __name__ == "__main__":

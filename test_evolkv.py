@@ -2,7 +2,16 @@ import random
 import unittest
 
 from ga import GAConfig, evolve, gaussian_mutation, uniform_crossover
-from search import cache_score, complete_budgets, evolkv_search, fitness_score, population_size, pyramid_budgets
+from niah import Sample
+from search import (
+    cache_score,
+    complete_budgets,
+    evolkv_search,
+    fit_budgets,
+    fitness_score,
+    population_size,
+    pyramid_budgets,
+)
 
 
 class GeneticOperators(unittest.TestCase):
@@ -61,10 +70,30 @@ class Formulas(unittest.TestCase):
         completed = complete_budgets([64, 192, 64, 400], 512)
         self.assertAlmostEqual(sum(completed) / 4, 512, delta=1)
 
-    def test_pyramid_decreases_with_target_mean(self):
-        budgets = pyramid_budgets(8, 128, 32)
-        self.assertEqual(budgets, sorted(budgets, reverse=True))
-        self.assertAlmostEqual(sum(budgets) / 8, 128, delta=1)
+    def test_pyramid_matches_kvcache_factory(self):
+        for target, first, last in [(128, 220, 36), (256, 469, 55), (512, 968, 71)]:
+            budgets = pyramid_budgets(24, target, 32)
+            self.assertEqual((budgets[0], budgets[-1]), (first, last))
+            self.assertEqual(budgets, sorted(budgets, reverse=True))
+
+    def test_fit_budgets_hits_target_exactly(self):
+        for budgets in ([512, 32, 32, 400], [32, 40, 33, 32], [128, 128, 128, 128]):
+            fitted = fit_budgets(budgets, 128, 32)
+            self.assertEqual(sum(fitted), 128 * 4)
+            self.assertGreaterEqual(min(fitted), 32)
+
+    def test_fit_budgets_keeps_proportions_above_floor(self):
+        self.assertEqual(fit_budgets([132, 232], 82, 32), [65, 99])
+
+    def test_fit_budgets_all_at_floor_becomes_uniform(self):
+        self.assertEqual(fit_budgets([32, 32], 128, 32), [128, 128])
+
+    def test_recall_needs_full_answer_but_partial_score_does_not(self):
+        sample = Sample([], ["5279348", "2978347"])
+        self.assertEqual(sample.score("52799 2978347"), 0.5)
+        self.assertAlmostEqual(sample.partial_score("52799 2978347"), (4 / 7 + 1) / 2)
+        self.assertEqual(sample.partial_score("tidak tahu"), 0)
+        self.assertEqual(sample.partial_score("5279348 2978347"), 1)
 
     def test_population_size_matches_paper(self):
         self.assertEqual([population_size(n) for n in (2, 4, 8, 16, 32)], [6, 8, 10, 12, 14])
@@ -78,6 +107,26 @@ class GroupSearch(unittest.TestCase):
         budgets, _ = evolkv_search(evaluate, 8, 128, 32, 512, 4, config, seed=6, log=lambda _: None)
         others = [b for i, b in enumerate(budgets) if i not in (2, 5)]
         self.assertGreater(min(budgets[2], budgets[5]), max(others))
+
+    def test_every_candidate_respects_the_target(self):
+        means = []
+
+        def evaluate(budgets):
+            means.append(sum(budgets) / len(budgets))
+            return budgets[0]
+
+        budgets, _ = evolkv_search(evaluate, 8, 128, 32, 512, 4, GAConfig(generations=3), log=lambda _: None)
+        self.assertEqual(set(means), {128})
+        self.assertEqual(sum(budgets), 128 * 8)
+
+    def test_history_records_extra_columns_for_best_candidate(self):
+        history = []
+        evolkv_search(
+            lambda b: b[0], 4, 128, 32, 512, 4, GAConfig(population_size=4, generations=1),
+            log=lambda _: None, history=history, describe=lambda b: {"first_budget": b[0]},
+        )
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[-1]["first_budget"], history[-1]["best_fitness"] / 1.3)
 
     def test_groups_cover_layers_not_divisible_by_group_size(self):
         budgets, _ = evolkv_search(
